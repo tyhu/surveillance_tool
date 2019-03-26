@@ -1,0 +1,266 @@
+import myconfig as cfg
+import cv2
+from PIL import Image
+import random
+import numpy as np
+import pickle
+
+import torch
+from torch.autograd import Variable
+
+### Object Detection
+from yolov3.darknet import Darknet
+from yolov3.util import write_results, load_classes, prep_image, post_rescale
+
+### Face Detection
+from mtcnn.model import PNet, RNet, ONet
+import mtcnn.box_utils as mtcnn_util
+#from mtcnn.box_utils import nms, calibrate_box, get_image_boxes, convert_to_square, _preprocess
+
+### Face Id (vggface)
+### Person ReID
+from deep_reid import load_person_reid_model, extract_reid_feats
+
+### Object Tracking (deep_sort)
+from deep_sort import nn_matching
+from deep_sort.detection import Detection
+from deep_sort.tracker import Tracker
+
+
+"""
+Manager for Object Detection
+"""
+class DetectMng(object):
+    def __init__(self, cfg_fn, weight_fn, class_fn='yolov3/data/coco.names', color_fn='yolov3/pallete', conf=0.5, nms_thres=0.4):
+        self.model = Darknet(cfg_fn)
+        self.model.load_weights(weight_fn)
+        self.model.cuda()
+        self.model.eval()
+        self.model.net_info['height'] = 416
+
+        self.classes = load_classes(class_fn)
+        self.colors = pickle.load(open(color_fn, "rb"))
+        self.inp_dim = self.model.net_info['height']
+        self.confidence = conf
+        self.num_classes = len(self.classes)
+        self.nms_thesh = nms_thres
+       
+    def detect_img(self, image):
+        image, ori_im, dim = prep_image(image, self.inp_dim)
+        image = image.cuda()
+        with torch.no_grad():
+            output = self.model(Variable(image), True)
+            output = write_results(output, self.confidence, self.num_classes, nms = True, nms_conf = self.nms_thesh)
+            output = output.cpu()
+            output = post_rescale(output, self.inp_dim, dim)
+        return output.numpy()
+
+        
+    def visualize_img(self, image, output):
+        list(map(lambda x: self._write(x, image), output))
+        return image
+
+    def _write(self, x, img):
+        #c1 = tuple(x[1:3].int())
+        #c2 = tuple(x[3:5].int())
+        c1 = tuple(x[1:3].astype('int'))
+        c2 = tuple(x[3:5].astype('int'))
+        cls = int(x[-1])
+        label = "{0}".format(self.classes[cls])
+        color = random.choice(self.colors)
+        cv2.rectangle(img, c1, c2,color, 1)
+        t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_PLAIN, 1 , 1)[0]
+        c2 = c1[0] + t_size[0] + 3, c1[1] + t_size[1] + 4
+        cv2.rectangle(img, c1, c2,color, -1)
+        cv2.putText(img, label, (c1[0], c1[1] + t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 1, [225,255,255], 1);
+        return img
+
+
+"""
+Manager for Face Detection
+"""
+class MTCNNMng(object):
+    def __init__(min_face_size=20.0, thresholds=[0.6, 0.7, 0.8], nms_thresholds=[0.7, 0.7, 0.7]):
+        self.pnet, self.rnet, self.onet = PNet(), RNet(), ONet()
+        self.onet.eval()
+
+        self.min_face_size = min_face_size
+        self.min_detection_size = 12
+        self.factor = 0.707 # sqrt(0.5)
+        self.thresholds = thresholds
+        self.nms_thresholds = nms_thresholds
+        self.m = self.min_detection_size/min_face_size
+
+    def detect_img(self, image):
+        image = Image.fromarray(image)
+        width, height = image.size
+        min_length = min(height, width)
+        min_length *= self.m
+        scales = []
+
+        factor_count = 0
+        while min_length > self.min_detection_size:
+            scales.append(m*factor**factor_count)
+            min_length *= factor
+            factor_count += 1
+
+        ### P-Net
+        bboxes = []
+        for s in scales:  # P-Net
+            bboxes += self._run_pnet(image, scale=s)
+
+        ### R-Net
+        bboxes = self._run_rnet(image, bboxes)
+        
+        ### O-Net
+        bboxes, landmarks = self._run_onet(image, bboxes)
+        
+        ### calibration
+        width = bboxes[:, 2] - bboxes[:, 0] + 1.0
+        height = bboxes[:, 3] - bboxes[:, 1] + 1.0
+        xmin, ymin = bboxes[:, 0], bboxes[:, 1]
+        landmarks[:, 0:5] = np.expand_dims(xmin, 1) + np.expand_dims(width, 1)*landmarks[:, 0:5]
+        landmarks[:, 5:10] = np.expand_dims(ymin, 1) + np.expand_dims(height, 1)*landmarks[:, 5:10]
+
+        bboxes = mtcnn_util.calibrate_box(bboxes, offsets)
+        keep = mtcnn_util.nms(bboxes, self.nms_thresholds[2], mode='min')
+        bboxes = bboxes[keep]
+        landmarks = landmarks[keep]
+
+        return bounding_boxes, landmarks
+
+
+    def _run_pnet(self, image, scale):
+        width, height = image.size
+        sw, sh = math.ceil(width*scale), math.ceil(height*scale)
+        img = image.resize((sw, sh), Image.BILINEAR)
+        img = np.asarray(img, 'float32')
+        img = torch.FloatTensor(_preprocess(img))
+    
+        output = self.pnet(img)
+        probs = output[1].data.numpy()[0, 1, :, :]
+        offsets = output[0].data.numpy()
+
+        boxes = self._generate_bboxes(probs, offsets, scale, self.threshold[0])
+        if len(boxes) == 0:
+            return None
+        keep = mtcnn_util.nms(boxes[:, 0:5], overlap_threshold=0.5)
+        return boxes[keep]
+
+    def _run_rnet(self, image, bboxes):
+        img_boxes = mtcnn_util.get_image_boxes(bboxes, image, size=24)
+        img_boxes = torch.FloatTensor(img_boxes)
+        output = self.rnet(img_boxes)
+        offsets = output[0].data.numpy()  # shape [n_boxes, 4]
+        probs = output[1].data.numpy()  # shape [n_boxes, 2]
+
+        keep = np.where(probs[:, 1] > self.thresholds[1])[0]
+        bboxes = bboxes[keep]
+        bboxes[:, 4] = probs[keep, 1].reshape((-1,))
+        offsets = offsets[keep]
+
+        keep = mtcnn_util.nms(bboxes, self.nms_thresholds[1])
+        bboxes = bboxes[keep]
+        bboxes = mtcnn_util.calibrate_box(bounding_boxes, offsets[keep])
+        bboxes = mtcnn_util.convert_to_square(bboxes)
+        bboxes[:, 0:4] = np.round(bboxes[:, 0:4])
+        return bboxes
+
+    def _run_onet(self, image, bboxes):
+        img_boxes = mtcnn_util.get_image_boxes(bboxes, image, size=48)
+        if len(img_boxes) == 0: 
+            return [], []
+        img_boxes = torch.FloatTensor(img_boxes)
+        output = self.onet(img_boxes)
+        landmarks = output[0].data.numpy()  # shape [n_boxes, 10]
+        offsets = output[1].data.numpy()  # shape [n_boxes, 4]
+        probs = output[2].data.numpy()  # shape [n_boxes, 2]
+
+        keep = np.where(probs[:, 1] > self.thresholds[2])[0]
+        bboxes = bboxes[keep]
+        bboxes[:, 4] = probs[keep, 1].reshape((-1,))
+        offsets = offsets[keep]
+        landmarks = landmarks[keep]
+        return bboxes, landmarks
+
+    def _generate_bboxes(self, probs, offsets, scale, threshold):
+        """
+        Generate bounding boxes at places where there is probably a face.
+        """
+        stride = 2
+        cell_size = 12
+
+        inds = np.where(probs > threshold)
+
+        if inds[0].size == 0:
+            return np.array([])
+
+        tx1, ty1, tx2, ty2 = [offsets[0, i, inds[0], inds[1]] for i in range(4)]
+
+        offsets = np.array([tx1, ty1, tx2, ty2])
+        score = probs[inds[0], inds[1]]
+
+        # P-Net is applied to scaled images, so we need to rescale bounding boxes back
+        bounding_boxes = np.vstack([
+            np.round((stride*inds[1] + 1.0)/scale),
+            np.round((stride*inds[0] + 1.0)/scale),
+            np.round((stride*inds[1] + 1.0 + cell_size)/scale),
+            np.round((stride*inds[0] + 1.0 + cell_size)/scale),
+            score, offsets
+        ])
+
+        return bounding_boxes.T
+
+
+"""
+Manager for Object Tracking
+"""
+class TrackMng(object):
+    def __init__(self, max_cosine_distance=-0.1, nn_budget=1, color_fn='deep_sort/pallete'):
+        metric = nn_matching.NearestNeighborDistanceMetric(
+            "cosine", max_cosine_distance, nn_budget)
+        self.tracker = Tracker(metric)
+        self.colors = pickle.load(open(color_fn,'rb'))
+        
+    def track_img(self, bboxes, scores, features):
+        if scores is None:
+            scores = np.array([1]*len(bboxes))
+        if features is None:
+            features = np.array([[1,1]]*len(bboxes))
+        detections = self._create_detections(bboxes, scores, features)
+        self.tracker.predict()
+        self.tracker.update(detections)
+
+    def _create_detections(self, bboxes, scores, features):
+        detection_list = []
+        for i in range(len(bboxes)):
+            bbox, score, feature = bboxes[i], scores[i], features[i]
+            detection_list.append(Detection(bbox, score, feature))
+        return detection_list
+
+    def visualize_img(self, img):
+        for track in self.tracker.tracks:
+            if track.state!=2: continue
+            if track.time_since_update>1: continue
+            bbox = track.to_tlbr()
+            c1 = tuple(bbox[:2].astype('int'))
+            c2 = tuple(bbox[2:4].astype('int'))
+            color = self.colors[track.track_id]
+            label = 'id_'+str(track.track_id)
+
+            cv2.rectangle(img, c1, c2, color, 1)
+            t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_PLAIN, 1 , 1)[0]
+            c2 = c1[0] + t_size[0] + 3, c1[1] + t_size[1] + 4
+            cv2.rectangle(img, c1, c2,color, -1)
+            cv2.putText(img, label, (c1[0], c1[1] + t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 1, [225,255,255], 1);
+
+
+
+"""
+Manager for person reid
+"""
+"""
+class PersonReIDMng(object):
+    def __init__():
+    def extract_feats():
+"""
