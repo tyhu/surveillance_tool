@@ -2,6 +2,7 @@ import myconfig as cfg
 import cv2
 from PIL import Image
 import random
+import math
 import numpy as np
 import pickle
 
@@ -19,7 +20,7 @@ import mtcnn.box_utils as mtcnn_util
 
 ### Face Id (vggface)
 ### Person ReID
-from deep_reid import load_person_reid_model, extract_reid_feats
+from deep_reid.reid_util import load_person_reid_model, extract_reid_feats
 
 ### Object Tracking (deep_sort)
 from deep_sort import nn_matching
@@ -80,7 +81,7 @@ class DetectMng(object):
 Manager for Face Detection
 """
 class MTCNNMng(object):
-    def __init__(min_face_size=20.0, thresholds=[0.6, 0.7, 0.8], nms_thresholds=[0.7, 0.7, 0.7]):
+    def __init__(self, min_face_size=20.0, thresholds=[0.6, 0.7, 0.8], nms_thresholds=[0.7, 0.7, 0.7]):
         self.pnet, self.rnet, self.onet = PNet(), RNet(), ONet()
         self.onet.eval()
 
@@ -100,22 +101,23 @@ class MTCNNMng(object):
 
         factor_count = 0
         while min_length > self.min_detection_size:
-            scales.append(m*factor**factor_count)
-            min_length *= factor
+            scales.append(self.m*self.factor**factor_count)
+            min_length *= self.factor
             factor_count += 1
 
         ### P-Net
-        bboxes = []
-        for s in scales:  # P-Net
-            bboxes += self._run_pnet(image, scale=s)
+        bboxes = self._run_pnet(image, scales)
+        if len(bboxes)==0: return [],[]
 
         ### R-Net
         bboxes = self._run_rnet(image, bboxes)
         
         ### O-Net
-        bboxes, landmarks = self._run_onet(image, bboxes)
+        bboxes, landmarks, offsets = self._run_onet(image, bboxes)
         
         ### calibration
+        if len(bboxes)==0: return [],[]
+
         width = bboxes[:, 2] - bboxes[:, 0] + 1.0
         height = bboxes[:, 3] - bboxes[:, 1] + 1.0
         xmin, ymin = bboxes[:, 0], bboxes[:, 1]
@@ -127,21 +129,31 @@ class MTCNNMng(object):
         bboxes = bboxes[keep]
         landmarks = landmarks[keep]
 
-        return bounding_boxes, landmarks
+        return bboxes, landmarks
+
+    def _run_pnet(self, image, scales):
+        all_bboxes = []
+        for s in scales:
+            bboxes = self._run_pnet_once(image, s)
+            all_bboxes.append(bboxes)
+        all_bboxes = [i for i in all_bboxes if i is not None]
+        if len(all_bboxes)==0: return []
+        all_bboxes = np.vstack(all_bboxes)
+        return self._bbox_post_process(all_bboxes, self.nms_thresholds[0])
 
 
-    def _run_pnet(self, image, scale):
+    def _run_pnet_once(self, image, scale):
         width, height = image.size
         sw, sh = math.ceil(width*scale), math.ceil(height*scale)
         img = image.resize((sw, sh), Image.BILINEAR)
         img = np.asarray(img, 'float32')
-        img = torch.FloatTensor(_preprocess(img))
+        img = torch.FloatTensor(mtcnn_util._preprocess(img))
     
         output = self.pnet(img)
         probs = output[1].data.numpy()[0, 1, :, :]
         offsets = output[0].data.numpy()
 
-        boxes = self._generate_bboxes(probs, offsets, scale, self.threshold[0])
+        boxes = self._generate_bboxes(probs, offsets, scale, self.thresholds[0])
         if len(boxes) == 0:
             return None
         keep = mtcnn_util.nms(boxes[:, 0:5], overlap_threshold=0.5)
@@ -161,7 +173,7 @@ class MTCNNMng(object):
 
         keep = mtcnn_util.nms(bboxes, self.nms_thresholds[1])
         bboxes = bboxes[keep]
-        bboxes = mtcnn_util.calibrate_box(bounding_boxes, offsets[keep])
+        bboxes = mtcnn_util.calibrate_box(bboxes, offsets[keep])
         bboxes = mtcnn_util.convert_to_square(bboxes)
         bboxes[:, 0:4] = np.round(bboxes[:, 0:4])
         return bboxes
@@ -169,7 +181,7 @@ class MTCNNMng(object):
     def _run_onet(self, image, bboxes):
         img_boxes = mtcnn_util.get_image_boxes(bboxes, image, size=48)
         if len(img_boxes) == 0: 
-            return [], []
+            return [], [], []
         img_boxes = torch.FloatTensor(img_boxes)
         output = self.onet(img_boxes)
         landmarks = output[0].data.numpy()  # shape [n_boxes, 10]
@@ -181,7 +193,15 @@ class MTCNNMng(object):
         bboxes[:, 4] = probs[keep, 1].reshape((-1,))
         offsets = offsets[keep]
         landmarks = landmarks[keep]
-        return bboxes, landmarks
+        return bboxes, landmarks, offsets
+
+    def _bbox_post_process(self, bboxes, nms_thres):
+        keep = mtcnn_util.nms(bboxes[:,0:5], nms_thres)
+        bboxes = bboxes[keep]
+        bboxes = mtcnn_util.calibrate_box(bboxes[:,0:5], bboxes[:,5:])
+        bboxes = mtcnn_util.convert_to_square(bboxes)
+        bboxes[:,0:4] = np.round(bboxes[:,0:4])
+        return bboxes
 
     def _generate_bboxes(self, probs, offsets, scale, threshold):
         """
