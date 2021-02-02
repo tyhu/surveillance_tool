@@ -7,6 +7,7 @@ import numpy as np
 import pickle
 
 import torch
+import torchvision.transforms as transforms
 from torch.autograd import Variable
 
 ### Object Detection
@@ -27,6 +28,8 @@ from deep_sort import nn_matching
 from deep_sort.detection import Detection
 from deep_sort.tracker import Tracker
 
+### vggface2
+import vggface2.resnet as vgg_resnet
 
 """
 Manager for Object Detection
@@ -236,7 +239,7 @@ class MTCNNMng(object):
 Manager for Object Tracking
 """
 class TrackMng(object):
-    def __init__(self, max_cosine_distance=-0.1, nn_budget=1, color_fn='deep_sort/pallete'):
+    def __init__(self, max_cosine_distance=-0.1, nn_budget=5, color_fn='deep_sort/pallete'):
         metric = nn_matching.NearestNeighborDistanceMetric(
             "cosine", max_cosine_distance, nn_budget)
         self.tracker = Tracker(metric)
@@ -275,12 +278,38 @@ class TrackMng(object):
             cv2.putText(img, label, (c1[0], c1[1] + t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 1, [225,255,255], 1);
 
 
+class VggFace2Mng(object):
+    def __init__(self, modelfn=''):
+        N_IDENTITY = 8631
+        with open(modelfn, 'rb') as f:
+            obj = f.read()
+            weights = {key: torch.from_numpy(arr) for key, arr in pickle.loads(obj, encoding='latin1').items()}
+        model = vgg_resnet.resnet50(num_classes=N_IDENTITY, include_top=False)
+        model.load_state_dict(weights)
+        self.model = model
 
-"""
-Manager for person reid
-"""
-"""
-class PersonReIDMng(object):
-    def __init__():
-    def extract_feats():
-"""
+        self.preprocess = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((224,224)),  # Pre-trained model uses 224x224 input images
+            transforms.ToTensor(),
+        ])
+
+        self.mean_bgr = torch.Tensor([91.4953, 103.8827, 131.0912])
+
+    """
+    img: numpy in (w,h,c)
+    bboxes: [[x1,y1,x2,y2]]
+    """
+    def extract_feature(self, img, bboxes):
+        img = img[:, :, ::-1]
+        feat_list = []
+        for i in range(len(bboxes)):
+            x1,y1,x2,y2 = int(bboxes[i,0]), int(bboxes[i,1]), int(bboxes[i,2]), int(bboxes[i,3])
+            patch = img[y1:y2, x1:x2, :]
+            patch = self.preprocess(patch)
+            patch = patch - self.mean_bgr.unsqueeze(1).unsqueeze(1)
+            feat = self.model(patch.unsqueeze(0))
+            feat = feat.squeeze(0).squeeze(-1).squeeze(-1)
+            feat_list.append(feat.detach().numpy())
+        return np.array(feat_list)
+        
