@@ -19,9 +19,8 @@ from mtcnn.model import PNet, RNet, ONet
 import mtcnn.box_utils as mtcnn_util
 #from mtcnn.box_utils import nms, calibrate_box, get_image_boxes, convert_to_square, _preprocess
 
-### Face Id (vggface)
 ### Person ReID
-from deep_reid.reid_util import load_person_reid_model, extract_reid_feats
+#from deep_reid.reid_util import load_person_reid_model, extract_reid_feats
 
 ### Object Tracking (deep_sort)
 from deep_sort import nn_matching
@@ -30,6 +29,9 @@ from deep_sort.tracker import Tracker
 
 ### vggface2
 import vggface2.resnet as vgg_resnet
+
+### reid
+#from torchreid.utils import FeatureExtractor
 
 """
 Manager for Object Detection
@@ -313,3 +315,31 @@ class VggFace2Mng(object):
             feat_list.append(feat.detach().numpy())
         return np.array(feat_list)
         
+
+"""
+Person reID
+"""
+
+class ReIDMng(object):
+    def __init__(self, modelfn=''):
+        self.extractor = FeatureExtractor(
+            model_name='osnet_x1_0',
+            model_path=modelfn,
+            device='cuda'
+        )
+
+
+    """
+    img: np.array (from cv2)
+    bboxes: list of (x1,y1,x2,y2)
+    """
+    def torchreid_feature(self, img, bboxes):
+        img = img[:, :, ::-1]
+        feat_list = []
+        for i in range(len(bboxes)):
+            x1,y1,x2,y2 = int(bboxes[i,0]), int(bboxes[i,1]), int(bboxes[i,2]), int(bboxes[i,3])
+            patch = img[y1:y2, x1:x2, :]
+            feat = self.extractor(patch)
+            feat_list.append(feat.detach().numpy())
+        return np.array(feat_list)
+ 

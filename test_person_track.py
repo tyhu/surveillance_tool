@@ -10,7 +10,7 @@ detect_manager = DetectMng(cfg.detect_cfg, cfg.detect_weights)
 tracker_manager = TrackMng()
 
 
-vfn = 'data/output.avi'
+vfn = 'data/video_example.avi'
 vid = cv2.VideoCapture(vfn)
 success = True
 T = int(vid.get(cv2.CAP_PROP_FRAME_COUNT))
